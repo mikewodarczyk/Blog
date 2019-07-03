@@ -1,0 +1,70 @@
+<html>
+<page>
+    <p>
+        In a business application you may have a web page that needs to be printed.  Perhaps it is an invoice, packing slip, bill of lading or other document that is created through the application.  If your application is build with Blazor, you may not want to have all of the Blazor overhead
+        building the page.  It may make more sense to have MVC produce the HTML output.  On the server it is easier to capture the HTML output so that it can be embedded in an Email, transformed into a pdf file, or sent to a corporate printer or document store from the server.
+    </p>
+
+    <p>If the printable page is generated on the server with MVC, how do you get it to display in Blazor?</p>
+
+    <p>You could have Blazor navigate to the page, but then when returning to the Blazor app, there may be significant overhead of loading and restarting the Web assembly code.</p>
+
+    <p>An alternative is to have a light-weight page that requests and displays the printable page inside the Blazor app.</p>
+
+    <p>The razor code below includes additional style settings so that the Blazor application's "sidebar" and "top-row" elements disappear, leaving only the printable page.</p>
+
+    <p>
+        The (MarkupString) modifier on the Body variable lets Blazor know that the text is supposed to be raw HTML.  Without this tag it would get HTML-encoded and not interpreted by the browser.
+
+        <h4>Index.razor</h4>
+<pre>
+<code>
+@page "/PackingSlip/{TransferRequestId:int}"
+@inherits IndexBase
+
+&lt;style&gt;
+    .sidebar {
+        display: none;
+    }
+
+    .top-row {
+        display: none;
+    }
+&lt;/style&gt;
+@((MarkupString)Body)
+
+</code>
+</pre>
+
+        <h4>IndexBase.cs</h4>
+<pre>
+<code>
+using Microsoft.AspNetCore.Components;
+using System;
+using System.Net.Http;
+using System.Threading.Tasks;
+
+namespace MyApp.Client.Pages.PackingSlip
+{
+    public class IndexBase: ComponentBase
+    {
+        [Inject]
+        protected HttpClient HttpClient { get; set; }
+
+        [Parameter]
+        protected int TransferRequestId { get; set; }
+
+        protected string Body { get; set; }
+
+        protected override async Task OnInitAsync()
+        {
+            Body = await HttpClient.GetStringAsync($"../PackingSlip/{TransferRequestId}");            
+        }
+    }
+}
+</code>
+</pre>
+
+        Be sure to only load your own web pages this way.  If you cannot control the HTML data coming from the HttpClient request, it could contain malicious code that you would not want affecting your site.
+</page>
+</html>

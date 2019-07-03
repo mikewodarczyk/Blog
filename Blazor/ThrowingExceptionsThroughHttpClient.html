@@ -1,0 +1,299 @@
+<html>
+<page>
+    There are some exceptions in a web api that are just meant for the client to show to the user.&nbsp; Using the HttpClient and ASP.net Core's controller with the standard pipeline, these exceptions are converted into a general "Server Error" 500 error.&nbsp; This error doesn't do the client or the user any good.&nbsp; Though it is generally a bad idea to send exceptions from a web service to the client, there are just some exceptions that are best dealt with in the client.<br />
+    <br />
+    Starting with the case of sending some sort of object (say a customer) from the web API to the server, the context method may throw exceptions that would be nice to see in the client.  Ok this case is contrived.  These exceptions could just be checks of the customer on the client side, but in reality there may be more complicated checks that throw exceptions.<br />
+    <br />
+<pre>
+<code>
+// Entity Framework context
+public class CustomerContext: DbContext {
+    ...
+
+    public CustomerDoesNotExist: Exception {}
+    public CustomerBlocked: Exception {}
+    public CustomerExpiredException: Exception {
+         public DateTime LastOrderDate {get; }
+         public CustomerExpired(DateTime lastOrderDate) {
+             LastOrderDate = lastOrderDate;
+         }
+    }
+
+    DbSet<Customer> Customers {get; set;}
+
+    public async Task<Customer> GetCustomer(int customerId) {
+
+        Customer cust = Customers
+                  .FirstOrDefaultAsync(c = > c.Id == customerId);
+
+        if (cust == null ) throw new CuetomerDoesNotExist();
+        if (cust.LastOrderDate < DateTime.Now.SubtractDays(100))
+        {
+            throw new CustomerExpiredException(cust.LastOrderDate);
+         }
+        if (cust.IsBlocked) throw new CustomerBlockedException();
+        return customer;
+    }
+}
+</code>
+</pre>
+    <br />
+    Now the controller could looks like this:
+    <br />
+<pre>
+<code>
+// Controller Code
+[Route("api/Customer")]
+public class CustomerController: Controller {
+     ...
+
+     [Route("{customerId:int}")]
+     public async Task<Customer> Get(int customerId) {
+       return await Context
+             .GetCustomer(customerId);  // throws exceptions
+     }
+}
+</code>
+</pre>
+    <br />
+    In Blazor my backing code would look like this:
+    <br />
+<pre>
+<code>
+public MyPageBase: ComponentBase {
+     [Inject]
+     protected HttpClient HttpClient {get; set;}
+
+     [Parameter]
+     protected int CustomerId {get; set;}
+
+     protected Customer Customer {get; set;
+
+     protected override async Task OnInitAsync() {
+       try 
+       {
+          Customer = await HttpClient
+              .GetJsonAsync<Customer>($"../api/Customer/{CustomerId}");
+       } 
+       catch (Exception e) 
+       {
+           Console.WriteLine(e);
+       }
+     }
+}
+</code>
+</pre>
+    <br />
+    The problem with this is that the ASP.net core MVC pipeline removes the exceptions.  All that you catch on the
+    Blazor side is a "Server Error" 500 error no matter what exception is thrown from the CustomerContext.
+    <br />
+
+    <h2>Solution</h2>
+
+    A solution will take multiple steps, but most of them are done once and then can work for all similar cases.
+
+    <h3>Step 1: If possible make the exceptions that you want to pass through inherit from a base class</h3>
+
+<pre>
+<code>
+// Entity Framework context
+public class CustomerContext: DbContext {
+    ...
+
+    public CustomerExceptionBase: Exception {}
+    public CustomerDoesNotExist: CustomerExcptionBase {}
+    public CustomerBlocked: CustomerExcptionBase {}
+    public CustomerExpiredException: CustomerExcptionBase {
+         public DateTime LastOrderDate {get; }
+         public CustomerExpired(DateTime lastOrderDate) {
+             LastOrderDate = lastOrderDate;
+         }
+    }
+
+    DbSet<Customer> Customers {get; set;}
+
+    public async Task<Customer> GetCustomer(int customerId) {
+        Customer cust = Customers
+                   .FirstOrDefaultAsync(c = > c.Id == customerId);
+        if (cust == null ) throw new CuetomerDoesNotExist();
+        if (cust.LastOrderDate < DateTime.Now.SubtractDays(100))
+        {
+            throw new CustomerExpiredException(cust.LastOrderDate);
+         }
+        if (cust.IsBlocked) throw new CustomerBlockedException();
+        return customer;
+    }
+}
+</code>
+</pre>
+    This will make catching these exceptions (vs SQL database exceptions or EntityFramework exceptions) easy.
+    <br />
+    <h3>Step 2.  Add a new Exception type that will "go through" the asp.net Core pipeline.</h3>
+<pre>
+<code>
+   public class BlazorClientException: Exception {
+         public BlazorClientException(Exception inner): base(inner);
+   }
+</code>
+</pre>
+
+    <h3>Step 3.  Catch, wrap, and re-throw the exceptions you want to pass through the pipeline</h3>
+
+<pre>
+<code>
+// Controller Code
+[Route("api/Customer")]
+public class CustomerController: Controller {
+     ...
+
+     [Route("{customerId:int}")]
+     public async Task<Customer> Get(int customerId) {
+         try {
+            return await Context
+                  .GetCustomer(customerId);  // throws exceptions
+         } catch (CustomerException ex) {
+             throw new BlazorClientException(ex);  // pass through
+         }
+     }
+}
+</code>
+</pre>
+
+    <h3>Step 4.  Make an asp.net pipeline step that will sent the BlazorClientExceptions sent as Json</h3>
+
+    Here I use the JSON.Net library from Newtonsoft (which I think is now part of Microsoft). This library
+    lets me add class information to the JSON data so that I can deserialize the exact same Exceptions on
+    the Blazor client side.
+
+<pre>
+<code>
+ public class ErrorHandlingMiddleware
+ {
+    private readonly RequestDelegate next;
+    public ErrorHandlingMiddleware(RequestDelegate next)
+    {
+        this.next = next;
+    }
+
+    public async Task Invoke(HttpContext context /* other dependencies */)
+    {
+        try
+        {
+            await next(context);
+        }
+        catch (Exception ex)
+        {
+            await HandleExceptionAsync(context, ex);
+        }
+    }
+
+    private static Task HandleExceptionAsync(HttpContext context, Exception ex)
+    {
+        var code = HttpStatusCode.InternalServerError; // 500 if unexpected
+        context.Response.ContentType = "application/json";
+        context.Response.StatusCode = (int)code;
+        if (ex is BlazorClientException)
+        {
+           // send to the client as Json, but include class info
+           // so I can tell on the other side what exception was sent.
+           JsonSerializerSettings settings = new JsonSerializerSettings();
+           settings.TypeNameHandling = TypeNameHandling.All;
+           var result = JsonConvert.SerializeObject(ex.InnerException, settings);
+           return context.Response.WriteAsync(result);
+        }
+        else
+        {
+           System.Diagnostics.Debug.WriteLine(ex);
+        }
+        return context.Response.WriteAsync("");     
+    }
+}
+</code>
+</pre>
+
+    <h3>Step 5.  Add the middleware to the asp.net Core pipeline</h3>
+    In the Startup class method configure add this line BEFORE the blazor service.
+    <br />
+<pre>
+<code>
+app.UseMiddleware(typeof(ErrorHandlingMiddleware));
+</code>
+</pre>
+
+    <h3>Step 6. In blazor add HttpClient extensions that handle the exception catching</h3>
+
+<pre>
+<code>
+public static class HttpClientExtensions
+{
+   public static async Task<T> ExecuteJsonWExceptionAsync<T>(
+        Func<Task<HttpResponseMessage>> httpClientCallAsync)
+   {
+     HttpResponseMessage response = await httpClientCallAsync();
+     if (response.IsSuccessStatusCode)
+     {
+       return System.Text.Json.Serialization.JsonSerializer.Parse<T>(
+          (await response.Content.ReadAsStringAsync()), new JsonSerializerOptions
+          {
+             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+          });
+     }
+     else
+     {
+       JsonSerializerSettings settings = new JsonSerializerSettings();
+       settings.TypeNameHandling = TypeNameHandling.All;
+       throw JsonConvert.DeserializeObject(
+           await response.Content.ReadAsStringAsync(), settings) as Exception;
+     }
+  }
+
+
+  public static async Task<T> PostJsonWithExceptionAsync<T>(
+       this HttpClient httpClient,
+       string url,
+       HttpContent httpContent = null)
+  {
+     return await ExecuteJsonWExceptionAsync<T>(
+          () => httpClient.PostAsync(url, httpContent));
+  }
+
+  public static async Task<T> GetJsonWithExceptionAsync<T>(
+         this HttpClient httpClient,
+         string url)
+  {
+     return await ExecuteJsonWExceptionAsync<T>(() => httpClient.GetAsync(url));
+  }
+}
+</code>
+</pre>
+
+    <h3>Step 7. Finally in blazor, use the new methods and catch the real exceptions</h3>
+
+<pre>
+<code>
+public MyPageBase: ComponentBase {
+     [Inject]
+     protected HttpClient HttpClient {get; set;}
+
+     [Parameter]
+     protected int CustomerId {get; set;}
+
+     protected Customer Customer {get; set;
+
+     protected override async Task OnInitAsync() {
+       try 
+       {
+          Customer = await HttpClient
+              .GetJsonWithExceptionAsync<Customer>($"../api/Customer/{CustomerId}");
+       } 
+       catch (CustomerExpiredException e) 
+       {
+           Console.WriteLine($"Oh no! Customer Expired.  Last Order Date {e.LastOrderDate}.");
+       }
+     }
+}
+</code>
+</pre>
+
+</page>
+</html>
